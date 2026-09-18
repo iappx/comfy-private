@@ -24,6 +24,8 @@ install -d -m 700 \
     "$XDG_CACHE_HOME" \
     "$MPLCONFIGDIR"
 
+install -d "$DATA_ROOT/models" "$DATA_ROOT/custom_nodes"
+
 if [ "${COMFY_ALLOW_CUSTOM_NODES:-1}" != "1" ]; then
     set -- --disable-all-custom-nodes "$@"
 fi

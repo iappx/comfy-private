@@ -87,6 +87,16 @@ read -r -t 5 banner <&3 || fail "no banner through the tunnel"
 exec 3<&-
 [[ $banner == SSH-2.0-* ]] || fail "unexpected banner through the tunnel: $banner"
 
+echo "== the launcher creates every directory ComfyUI expects"
+docker exec "$NAME" sh -c '
+    comfyui >/dev/null 2>&1 || true
+    for d in /dev/shm/comfy/output /dev/shm/comfy/input /dev/shm/comfy/temp \
+             /dev/shm/comfy/user /comfy/models /comfy/custom_nodes
+    do
+        [ -d "$d" ] || { echo "missing: $d"; exit 1; }
+    done
+' || fail "the launcher left a directory ComfyUI needs uncreated"
+
 echo "== entrypoint refuses to start without PUBLIC_KEY"
 if docker run --rm -e COMFY_AUTOSTART=0 "$IMAGE" >/dev/null 2>&1; then
     fail "container started without PUBLIC_KEY"

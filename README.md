@@ -181,7 +181,7 @@ to `*.md` do not trigger a build):
   without CUDA and torch;
 - a run of [`ci/smoke-test.sh`](ci/smoke-test.sh) against that twin.
 
-The smoke test starts a container with a throwaway key and checks seven things:
+The smoke test starts a container with a throwaway key and checks eight things:
 
 1. the entrypoint prints a host key fingerprint to the log;
 2. the image ships no baked-in host keys;
@@ -191,7 +191,8 @@ The smoke test starts a container with a throwaway key and checks seven things:
    `permitrootlogin without-password`, `permitemptypasswords no`, `x11forwarding no`,
    `allowtcpforwarding local`;
 6. a connection goes through `ssh -L` and returns an SSH banner;
-7. the container does not start without `PUBLIC_KEY`.
+7. running the launcher creates every directory ComfyUI expects, on disk and in RAM;
+8. the container does not start without `PUBLIC_KEY`.
 
 `publish` runs after a green smoke test and only outside pull requests: it builds
 `linux/amd64` and pushes to `ghcr.io/<owner>/<repo>`. Build arg values come from the `ARG`
