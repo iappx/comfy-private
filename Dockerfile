@@ -1,4 +1,4 @@
-ARG CUDA_IMAGE=nvidia/cuda:12.8.1-cudnn-runtime-ubuntu22.04
+ARG CUDA_IMAGE=nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04
 FROM ${CUDA_IMAGE}
 
 ARG COMFYUI_REF=v0.36.0
@@ -25,7 +25,7 @@ RUN apt-get update \
       python3 \
       python3-venv \
       libgl1 \
-      libglib2.0-0 \
+      libglib2.0-0t64 \
  && rm -rf /var/lib/apt/lists/* \
  && rm -f /etc/ssh/ssh_host_*
 
