@@ -1,79 +1,81 @@
-# Приватный инстанс ComfyUI
+# Private ComfyUI instance
 
-Docker-образ с ComfyUI, который не выставлен наружу: веб-интерфейс слушает только
-`127.0.0.1`, единственный открытый порт контейнера — SSH с входом по ключу, доступ
-к морде идёт через SSH-туннель. Рабочие каталоги, логи и база данных лежат в RAM,
-метаданные в результаты не вшиваются.
+A Docker image that runs ComfyUI without exposing it: the web UI listens on `127.0.0.1`
+only, the container's single open port is SSH with key-based login, and you reach the UI
+through an SSH tunnel. Scratch directories, logs and the database live in RAM, and no
+metadata is embedded in the results.
 
-## Чем это отличается от голого ComfyUI
+## How this differs from stock ComfyUI
 
-ComfyUI запускается скриптом [`comfyui.sh`](comfyui.sh) с фиксированным набором флагов:
+ComfyUI is launched by [`comfyui.sh`](comfyui.sh) with a fixed set of flags:
 
-| Флаг | Что даёт |
+| Flag | Effect |
 |---|---|
-| `--listen 127.0.0.1` | сервер доступен только изнутри контейнера |
-| `--disable-metadata` | промпты и воркфлоу не попадают в сохранённые файлы |
-| `--disable-api-nodes` | ноды, ходящие во внешние API, не регистрируются |
-| `--database-url sqlite:///:memory:` | БД ComfyUI живёт в памяти процесса и не пишется на диск |
-| `--output-directory`, `--input-directory`, `--temp-directory`, `--user-directory` | все четыре каталога перенесены в `/dev/shm/comfy` |
-| `--base-directory /comfy` | всё остальное, включая веса, остаётся на диске |
-| `--dont-print-server` | вывод сервера не печатается |
+| `--listen 127.0.0.1` | the server is reachable only from inside the container |
+| `--disable-metadata` | prompts and workflows are not embedded in saved files |
+| `--disable-api-nodes` | nodes that call external APIs are not registered |
+| `--database-url sqlite:///:memory:` | the ComfyUI database lives in process memory and never reaches disk |
+| `--output-directory`, `--input-directory`, `--temp-directory`, `--user-directory` | all four directories are moved to `/dev/shm/comfy` |
+| `--base-directory /comfy` | everything else, model weights included, stays on disk |
+| `--dont-print-server` | server output is not printed |
 
-Дополнительно к этому:
+On top of that:
 
-- `HF_HUB_DISABLE_TELEMETRY=1` и `DO_NOT_TRACK=1` заданы и в образе, и в самом скрипте запуска;
-- `XDG_CACHE_HOME` и `MPLCONFIGDIR` указывают в `/dev/shm/comfy/cache`;
-- `PYTHONDONTWRITEBYTECODE=1`, так что рядом с кодом не появляются `.pyc`;
-- в интерактивной сессии по SSH выставлены `HISTFILE=/dev/null` и `LESSHISTFILE=/dev/null`
-  (`/etc/profile.d/comfy.sh`, см. [Dockerfile](Dockerfile));
-- при `COMFY_AUTOSTART=1` вывод ComfyUI уходит в `/dev/shm/comfy/comfyui.log`,
-  а не в stdout контейнера.
+- `HF_HUB_DISABLE_TELEMETRY=1` and `DO_NOT_TRACK=1` are set both in the image and in the
+  launch script itself;
+- `XDG_CACHE_HOME` and `MPLCONFIGDIR` point into `/dev/shm/comfy/cache`;
+- `PYTHONDONTWRITEBYTECODE=1`, so no `.pyc` files pile up next to the code;
+- interactive SSH sessions get `HISTFILE=/dev/null` and `LESSHISTFILE=/dev/null`
+  (`/etc/profile.d/comfy.sh`, see the [Dockerfile](Dockerfile));
+- with `COMFY_AUTOSTART=1`, ComfyUI output goes to `/dev/shm/comfy/comfyui.log` instead of
+  the container's stdout.
 
-В образе нет ComfyUI-Manager и других надстроек: ставится только сам ComfyUI нужной версии
-и его `requirements.txt`.
+The image carries no ComfyUI-Manager and no other add-ons: only ComfyUI at the pinned
+version and its `requirements.txt` are installed.
 
 ## SSH
 
-Хост-ключи удаляются на этапе сборки (`rm -f /etc/ssh/ssh_host_*`), а ed25519-ключ
-генерируется при первом старте контейнера — общего для всех инстансов ключа в образе нет.
-Фингерпринт печатается в лог при запуске, его можно сверить при первом подключении.
+Host keys are deleted at build time (`rm -f /etc/ssh/ssh_host_*`) and an ed25519 key is
+generated when the container first starts, so the image contains no host key shared between
+instances. The fingerprint is printed to the log at startup; verify it when you connect for
+the first time.
 
-`PUBLIC_KEY` записывается в `/root/.ssh/authorized_keys` (режим 600) и сразу после этого
-переменная снимается, так что в окружение sshd она не попадает. Без `PUBLIC_KEY`
-[`entrypoint.sh`](entrypoint.sh) отказывается стартовать.
+`PUBLIC_KEY` is written to `/root/.ssh/authorized_keys` (mode 600) and unset immediately
+afterwards, so it never ends up in sshd's environment. Without `PUBLIC_KEY`,
+[`entrypoint.sh`](entrypoint.sh) refuses to start.
 
-Конфигурация sshd — [`sshd_hardening.conf`](sshd_hardening.conf):
+The sshd configuration is [`sshd_hardening.conf`](sshd_hardening.conf):
 
-| Директива | |
+| Directive | |
 |---|---|
-| `AuthenticationMethods publickey` | единственный допустимый метод |
-| `PasswordAuthentication no`, `KbdInteractiveAuthentication no`, `PermitEmptyPasswords no` | пароли выключены полностью |
-| `PermitRootLogin prohibit-password`, `AllowUsers root` | вход только root и только по ключу |
-| `PermitUserEnvironment no` | клиент не может подсунуть переменные окружения |
-| `AllowTcpForwarding local` | `ssh -L` работает, обратный проброс `-R` запрещён |
-| `GatewayPorts no`, `PermitTunnel no`, `AllowAgentForwarding no`, `X11Forwarding no` | остальные каналы закрыты |
-| `HostKey /etc/ssh/ssh_host_ed25519_key` | предлагается единственный тип хост-ключа |
-| `LoginGraceTime 20`, `MaxAuthTries 3`, `MaxSessions 4` | лимиты на подбор и на число сессий |
-| `ClientAliveInterval 30`, `ClientAliveCountMax 6` | мёртвые сессии закрываются |
-| `PrintMotd no`, `PrintLastLog no`, `Banner none` | при входе ничего не печатается |
+| `AuthenticationMethods publickey` | the only accepted method |
+| `PasswordAuthentication no`, `KbdInteractiveAuthentication no`, `PermitEmptyPasswords no` | passwords are off entirely |
+| `PermitRootLogin prohibit-password`, `AllowUsers root` | root only, by key only |
+| `PermitUserEnvironment no` | the client cannot inject environment variables |
+| `AllowTcpForwarding local` | `ssh -L` works, remote forwarding with `-R` is refused |
+| `GatewayPorts no`, `PermitTunnel no`, `AllowAgentForwarding no`, `X11Forwarding no` | the remaining channels are closed |
+| `HostKey /etc/ssh/ssh_host_ed25519_key` | a single host key type is offered |
+| `LoginGraceTime 20`, `MaxAuthTries 3`, `MaxSessions 4` | limits on guessing and on concurrent sessions |
+| `ClientAliveInterval 30`, `ClientAliveCountMax 6` | dead sessions are dropped |
+| `PrintMotd no`, `PrintLastLog no`, `Banner none` | nothing is printed on login |
 
-В [`Dockerfile`](Dockerfile) объявлен ровно один порт — `EXPOSE 22`.
+The [`Dockerfile`](Dockerfile) declares exactly one port: `EXPOSE 22`.
 
-## Сборка
+## Building
 
 ```bash
 docker build -t comfy-private .
 ```
 
-Параметры сборки:
+Build args:
 
-| ARG | По умолчанию |
+| ARG | Default |
 |---|---|
 | `CUDA_IMAGE` | `nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04` |
 | `COMFYUI_REF` | `v0.36.0` |
 | `TORCH_INDEX_URL` | `https://download.pytorch.org/whl/cu128` |
 
-Базовый образ и индекс колёс torch должны быть согласованы по версии CUDA:
+The base image and the torch wheel index have to agree on the CUDA version:
 
 ```bash
 docker build \
@@ -82,11 +84,12 @@ docker build \
   -t comfy-private .
 ```
 
-ComfyUI клонируется по тегу из `COMFYUI_REF`, каталог `.git` удаляется. Обновление версии —
-пересборка образа. Python берётся из базового образа (`python3` пакетом Ubuntu 24.04,
-то есть 3.12), зависимости ставятся в venv `/opt/venv`.
+ComfyUI is cloned at the tag given by `COMFYUI_REF` and its `.git` directory is removed;
+moving to another version means rebuilding the image. Python comes from the base image
+(the `python3` package of Ubuntu 24.04, that is 3.12) and dependencies are installed into
+the `/opt/venv` virtualenv.
 
-## Запуск
+## Running
 
 ```bash
 docker run -d --name comfy --gpus all \
@@ -97,125 +100,124 @@ docker run -d --name comfy --gpus all \
   comfy-private
 ```
 
-Рабочие каталоги и логи лежат в `/dev/shm`, поэтому его размер задаёт потолок для
-результатов и временных файлов. Entrypoint печатает при старте фактический размер
-`/dev/shm` и предупреждает, если тот оказался не tmpfs/ramfs.
+Scratch directories and logs live in `/dev/shm`, so its size is the ceiling for results and
+temporary files. The entrypoint prints the actual size of `/dev/shm` at startup and warns if
+it turns out not to be tmpfs or ramfs.
 
-## Подключение
+## Connecting
 
-Сверьте фингерпринт хост-ключа из лога контейнера:
+Check the host key fingerprint in the container log:
 
 ```bash
 docker logs comfy
 ```
 
-Поднимите туннель:
+Open the tunnel:
 
 ```bash
 ssh -i ~/.ssh/id_ed25519 -p 2222 -L 8188:127.0.0.1:8188 root@HOST
 ```
 
-ComfyUI открывается локально на `http://127.0.0.1:8188`.
+ComfyUI is then available locally at `http://127.0.0.1:8188`.
 
-Логи внутри контейнера:
+Logs inside the container:
 
 ```bash
 tail -f /dev/shm/comfy/comfyui.log
 tail -f /dev/shm/comfy/sshd.log
 ```
 
-Если ComfyUI не запускался автоматически, в SSH-сессии доступна команда `comfyui` —
-это тот же скрипт, и любые дополнительные аргументы он передаёт в `main.py`.
+If ComfyUI was not started automatically, the SSH session has a `comfyui` command — the same
+script, and any extra arguments are passed through to `main.py`.
 
-## Переменные окружения
+## Environment variables
 
-| Переменная | По умолчанию | Смысл |
+| Variable | Default | Meaning |
 |---|---|---|
-| `PUBLIC_KEY` | — | обязательна; при пустом значении entrypoint завершается с ошибкой |
-| `COMFY_AUTOSTART` | `1` | любое другое значение — поднять только sshd, ComfyUI запускать вручную |
-| `COMFY_ALLOW_CUSTOM_NODES` | `1` | любое другое значение добавляет `--disable-all-custom-nodes` |
-| `SSHD_LOG_TO_CONSOLE` | `0` | `1` — sshd логирует в консоль контейнера вместо файла в RAM |
-| `COMFY_PORT` | `8188` | порт ComfyUI на `127.0.0.1` |
+| `PUBLIC_KEY` | — | required; the entrypoint exits with an error if it is empty |
+| `COMFY_AUTOSTART` | `1` | any other value brings up sshd only, leaving ComfyUI to be started by hand |
+| `COMFY_ALLOW_CUSTOM_NODES` | `1` | any other value adds `--disable-all-custom-nodes` |
+| `SSHD_LOG_TO_CONSOLE` | `0` | `1` sends the sshd log to the container console instead of a file in RAM |
+| `COMFY_PORT` | `8188` | the port ComfyUI listens on at `127.0.0.1` |
 
-Пути тоже задаются переменными окружения образа: `COMFY_HOME=/opt/comfyui`,
+Paths are image environment variables too: `COMFY_HOME=/opt/comfyui`,
 `COMFY_DATA_ROOT=/comfy`, `COMFY_RAM_ROOT=/dev/shm/comfy`.
 
-## Куда что пишется
+## Where things are written
 
-| Путь | Носитель | Содержимое |
+| Path | Backed by | Contents |
 |---|---|---|
-| `/dev/shm/comfy/output` | RAM | результаты |
-| `/dev/shm/comfy/input` | RAM | входные файлы |
-| `/dev/shm/comfy/temp` | RAM | превью и промежуточные файлы |
-| `/dev/shm/comfy/user` | RAM | пользовательский каталог ComfyUI: настройки, сохранённые воркфлоу |
+| `/dev/shm/comfy/output` | RAM | results |
+| `/dev/shm/comfy/input` | RAM | input files |
+| `/dev/shm/comfy/temp` | RAM | previews and intermediate files |
+| `/dev/shm/comfy/user` | RAM | the ComfyUI user directory: settings, saved workflows |
 | `/dev/shm/comfy/cache` | RAM | `XDG_CACHE_HOME`, `MPLCONFIGDIR` |
-| `/dev/shm/comfy/comfyui.log`, `/dev/shm/comfy/sshd.log` | RAM | логи |
-| `sqlite:///:memory:` | RAM | база данных ComfyUI |
-| `/comfy/models` | диск | веса |
-| `/comfy/huggingface`, `/comfy/torch` | диск | `HF_HOME` и `TORCH_HOME`, если не переопределены |
+| `/dev/shm/comfy/comfyui.log`, `/dev/shm/comfy/sshd.log` | RAM | logs |
+| `sqlite:///:memory:` | RAM | the ComfyUI database |
+| `/comfy/models` | disk | model weights |
+| `/comfy/huggingface`, `/comfy/torch` | disk | `HF_HOME` and `TORCH_HOME` unless overridden |
 
-Каталог в RAM создаётся с режимом 700, как и все подкаталоги внутри него.
+The directory in RAM is created with mode 700, as is everything below it.
 
 ## Custom nodes
 
-Включены по умолчанию: `--disable-all-custom-nodes` добавляется только тогда, когда
-`COMFY_ALLOW_CUSTOM_NODES` не равна `1`. Перечисленные выше флаги — это аргументы
-самого ComfyUI и на код сторонних нод не распространяются.
+Enabled by default: `--disable-all-custom-nodes` is added only when
+`COMFY_ALLOW_CUSTOM_NODES` is set to something other than `1`. The flags listed above are
+arguments to ComfyUI itself and say nothing about what third-party node code does.
 
 ## CI
 
-[`.github/workflows/build.yml`](.github/workflows/build.yml), две джобы.
+[`.github/workflows/build.yml`](.github/workflows/build.yml), two jobs.
 
-`smoke-test` выполняется на push в `main`, на теги `v*` и на pull request
-(правки только в `*.md` сборку не запускают):
+`smoke-test` runs on pushes to `main`, on `v*` tags and on pull requests (changes confined
+to `*.md` do not trigger a build):
 
-- `actionlint` по самому workflow;
-- `shellcheck` по [`entrypoint.sh`](entrypoint.sh), [`comfyui.sh`](comfyui.sh)
-  и [`ci/smoke-test.sh`](ci/smoke-test.sh);
-- `docker build --check` по Dockerfile;
-- сборка облегчённого двойника [`ci/Dockerfile.sshtest`](ci/Dockerfile.sshtest):
-  `ubuntu:24.04` с теми же `entrypoint.sh`, `comfyui.sh` и `sshd_hardening.conf`, но без CUDA
-  и torch;
-- запуск [`ci/smoke-test.sh`](ci/smoke-test.sh) на этом двойнике.
+- `actionlint` on the workflow itself;
+- `shellcheck` on [`entrypoint.sh`](entrypoint.sh), [`comfyui.sh`](comfyui.sh) and
+  [`ci/smoke-test.sh`](ci/smoke-test.sh);
+- `docker build --check` on the Dockerfile;
+- a build of the lightweight twin [`ci/Dockerfile.sshtest`](ci/Dockerfile.sshtest):
+  `ubuntu:24.04` with the same `entrypoint.sh`, `comfyui.sh` and `sshd_hardening.conf`, but
+  without CUDA and torch;
+- a run of [`ci/smoke-test.sh`](ci/smoke-test.sh) against that twin.
 
-Смоук-тест поднимает контейнер с одноразовым ключом и проверяет семь вещей:
+The smoke test starts a container with a throwaway key and checks seven things:
 
-1. entrypoint печатает в лог фингерпринт хост-ключа;
-2. в образе нет вшитых хост-ключей;
-3. вход по ключу проходит;
-4. вход без ключа (пароль, keyboard-interactive) отбивается;
-5. `sshd -T` отдаёт `passwordauthentication no`, `authenticationmethods publickey`,
+1. the entrypoint prints a host key fingerprint to the log;
+2. the image ships no baked-in host keys;
+3. login with the key succeeds;
+4. login without the key (password, keyboard-interactive) is refused;
+5. `sshd -T` reports `passwordauthentication no`, `authenticationmethods publickey`,
    `permitrootlogin without-password`, `permitemptypasswords no`, `x11forwarding no`,
    `allowtcpforwarding local`;
-6. через `ssh -L` проходит соединение и приходит SSH-баннер;
-7. без `PUBLIC_KEY` контейнер не стартует.
+6. a connection goes through `ssh -L` and returns an SSH banner;
+7. the container does not start without `PUBLIC_KEY`.
 
-`publish` идёт после зелёного смоук-теста и только не на pull request: собирает
-`linux/amd64` и пушит в `ghcr.io/<owner>/<repo>`. Значения build args берутся из
-`ARG`-дефолтов Dockerfile, а `workflow_dispatch` позволяет разово переопределить
-`COMFYUI_REF`, `CUDA_IMAGE` и `TORCH_INDEX_URL`, не трогая файл. Кэш слоёв пишется
-в `:buildcache` рядом с образом.
+`publish` runs after a green smoke test and only outside pull requests: it builds
+`linux/amd64` and pushes to `ghcr.io/<owner>/<repo>`. Build arg values come from the `ARG`
+defaults in the Dockerfile, while `workflow_dispatch` can override `COMFYUI_REF`,
+`CUDA_IMAGE` and `TORCH_INDEX_URL` for a single run without touching the file. The layer
+cache is written to `:buildcache` next to the image.
 
-| Триггер | Теги |
+| Trigger | Tags |
 |---|---|
-| push в `main` | `latest`, `comfy-<COMFYUI_REF>`, `sha-<коммит>` |
-| тег `v1.2.3` | `1.2.3`, `comfy-<COMFYUI_REF>`, `sha-<коммит>` |
+| push to `main` | `latest`, `comfy-<COMFYUI_REF>`, `sha-<commit>` |
+| `v1.2.3` tag | `1.2.3`, `comfy-<COMFYUI_REF>`, `sha-<commit>` |
 
-## Локальная проверка
+## Running the checks locally
 
 ```bash
 docker build -f ci/Dockerfile.sshtest -t comfy-sshtest . && ci/smoke-test.sh comfy-sshtest
 ```
 
-Порты теста настраиваются переменными `SMOKE_SSH_PORT` (по умолчанию 2222)
-и `SMOKE_FWD_PORT` (9999).
+The test ports come from `SMOKE_SSH_PORT` (2222 by default) and `SMOKE_FWD_PORT` (9999).
 
-## Чего образ не делает
+## What the image does not do
 
-Всё перечисленное — про сеть и про файловую систему внутри контейнера. Тот, у кого
-root на хост-машине, видит процессы контейнера, его память, VRAM и содержимое `/dev/shm`;
-настройками внутри образа это не меняется. Точно так же освобождение диска после удаления
-контейнера не является гарантированным стиранием данных.
+Everything above is about the network and about the filesystem inside the container. Anyone
+with root on the host machine can see the container's processes, its memory, its VRAM and
+the contents of `/dev/shm`; no setting inside the image changes that. In the same way,
+freeing the disk after the container is removed is not a guaranteed erasure of the data.
 
-Исходящий трафик не фильтруется: контейнер может обращаться в сеть, и ограничить это
-средствами самого образа нельзя.
+Outbound traffic is not filtered: the container can reach the network, and the image itself
+offers no way to prevent that.
