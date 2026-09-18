@@ -1,240 +1,221 @@
-# Приватный ComfyUI-под на RunPod
+# Приватный инстанс ComfyUI
 
-Шаблон RunPod Pod с ComfyUI, собранный под требование: минимум записи на диск,
-никаких метаданных в выводе, единственный открытый порт — SSH по ключу.
-Образ собирается и публикуется в GHCR через GitHub Actions.
+Docker-образ с ComfyUI, который не выставлен наружу: веб-интерфейс слушает только
+`127.0.0.1`, единственный открытый порт контейнера — SSH с входом по ключу, доступ
+к морде идёт через SSH-туннель. Рабочие каталоги, логи и база данных лежат в RAM,
+метаданные в результаты не вшиваются.
 
-## Модель угроз: что достижимо, а что нет
+## Чем это отличается от голого ComfyUI
 
-| Угроза | Статус |
+ComfyUI запускается скриптом [`comfyui.sh`](comfyui.sh) с фиксированным набором флагов:
+
+| Флаг | Что даёт |
 |---|---|
-| Посторонний в интернете находит ваш ComfyUI | Закрыто: ComfyUI слушает `127.0.0.1`, HTTP-порты не проброшены, доступ только через SSH-туннель |
-| Подбор пароля по SSH | Закрыто: `AuthenticationMethods publickey`, пароли выключены |
-| Промпты и воркфлоу утекают в логи RunPod | Закрыто: вывод ComfyUI уходит в файл в RAM, а не в stdout контейнера |
-| Промпты и воркфлоу вшиты в сохранённые картинки | Закрыто: `--disable-metadata` |
-| Фронтенд и ноды ходят наружу | Закрыто: `--disable-api-nodes`, `--disable-all-custom-nodes`, телеметрия HF выключена |
-| Результаты и входные файлы остаются на диске | Ослаблено: они лежат в `/dev/shm` (RAM); на диск попадают только веса моделей |
-| Данные переживают под | Закрыто: Volume disk = 0 ГБ, container disk стирается при остановке |
-| **Оператор хоста читает контейнер или VRAM** | **Не закрыто** |
+| `--listen 127.0.0.1` | сервер доступен только изнутри контейнера |
+| `--disable-metadata` | промпты и воркфлоу не попадают в сохранённые файлы |
+| `--disable-api-nodes` | ноды, ходящие во внешние API, не регистрируются |
+| `--database-url sqlite:///:memory:` | БД ComfyUI живёт в памяти процесса и не пишется на диск |
+| `--output-directory`, `--input-directory`, `--temp-directory`, `--user-directory` | все четыре каталога перенесены в `/dev/shm/comfy` |
+| `--base-directory /comfy` | всё остальное, включая веса, остаётся на диске |
+| `--dont-print-server` | вывод сервера не печатается |
 
-Последняя строка — принципиальная. Защита от подглядывания со стороны хостера у RunPod
-**договорная**: их ToS запрещает хостам инспектировать данные пода, но технических гарантий
-(confidential computing, TEE-аттестация GPU) RunPod не предоставляет. Ничто внутри контейнера
-это не меняет. Secure Cloud даёт лучший ЦОД и стабильный IP, но не делает провайдера слепым.
+Дополнительно к этому:
 
-Отдельно: удаление контейнера не равно криптографическому стиранию. Container disk
-освобождается, но гарантии перезаписи блоков нет.
+- `HF_HUB_DISABLE_TELEMETRY=1` и `DO_NOT_TRACK=1` заданы и в образе, и в самом скрипте запуска;
+- `XDG_CACHE_HOME` и `MPLCONFIGDIR` указывают в `/dev/shm/comfy/cache`;
+- `PYTHONDONTWRITEBYTECODE=1`, так что рядом с кодом не появляются `.pyc`;
+- в интерактивной сессии по SSH выставлены `HISTFILE=/dev/null` и `LESSHISTFILE=/dev/null`
+  (`/etc/profile.d/comfy.sh`, см. [Dockerfile](Dockerfile));
+- при `COMFY_AUTOSTART=1` вывод ComfyUI уходит в `/dev/shm/comfy/comfyui.log`,
+  а не в stdout контейнера.
 
-## Почему не готовый образ
+В образе нет ComfyUI-Manager и других надстроек: ставится только сам ComfyUI нужной версии
+и его `requirements.txt`.
 
-`runpod/worker-comfyui` — образ для Serverless, а не для Pod. Популярные Pod-образы с ComfyUI
-тянут Jupyter, web-терминал `ttyd` и ComfyUI-Manager, пишут всё в stdout и открывают HTTP-порты
-по умолчанию. Вычищать это через поле «Start command» поверх чужого образа ненадёжно.
+## SSH
 
-## Почему не прокси-SSH RunPod
+Хост-ключи удаляются на этапе сборки (`rm -f /etc/ssh/ssh_host_*`), а ed25519-ключ
+генерируется при первом старте контейнера — общего для всех инстансов ключа в образе нет.
+Фингерпринт печатается в лог при запуске, его можно сверить при первом подключении.
 
-У RunPod два способа SSH:
+`PUBLIC_KEY` записывается в `/root/.ssh/authorized_keys` (режим 600) и сразу после этого
+переменная снимается, так что в окружение sshd она не попадает. Без `PUBLIC_KEY`
+[`entrypoint.sh`](entrypoint.sh) отказывается стартовать.
 
-1. **Basic SSH** через `ssh.runpod.io` — проксируется RunPod, не требует public IP,
-   но **не поддерживает проброс портов** (`ssh -L` падает с
-   `channel 2: open failed: unknown channel type: unsupported channel type`) и не умеет SCP/SFTP.
-2. **Full SSH** — прямое TCP-подключение на public IP пода, требует проброшенного TCP-порта 22
-   и работающего sshd внутри контейнера. Умеет всё.
+Конфигурация sshd — [`sshd_hardening.conf`](sshd_hardening.conf):
 
-Туннель к ComfyUI возможен только со вторым. Поэтому TCP 22 — единственный проброшенный порт.
-
-## CI
-
-[`.github/workflows/build.yml`](.github/workflows/build.yml), две джобы.
-
-`smoke-test` гоняется всегда, включая pull request:
-
-- `shellcheck` по рантайм-скриптам и по самому тесту;
-- `docker build --check` по Dockerfile;
-- сборка облегчённого двойника на `ubuntu:22.04` ([`ci/Dockerfile.sshtest`](ci/Dockerfile.sshtest)) —
-  тот же `entrypoint.sh`, тот же `sshd_hardening.conf`, без CUDA-слоя — и семь проверок на нём
-  ([`ci/smoke-test.sh`](ci/smoke-test.sh)): вход по ключу проходит, вход без ключа отбивается,
-  `sshd -T` отдаёт ожидаемую конфигурацию, `ssh -L` пробрасывается, в образе нет вшитых
-  хост-ключей, фингерпринт печатается в лог, без `PUBLIC_KEY` контейнер осознанно падает.
-
-Джоба укладывается в полминуты против девяти на реальный образ, а ломается в CI ровно тот
-класс ошибок, который иначе запирает вас снаружи оплаченного GPU-пода.
-
-`publish` идёт только после зелёного теста и только не на pull request. Первым шагом
-освобождается место на раннере: GitHub даёт **14 ГБ**, а сборка разворачивает 25–35 ГБ,
-так что без `free-disk-space` она падает на `no space left on device`.
-
-Замеры первого холодного прогона: `smoke-test` 0:33, `publish` 9:34 — из них 1:41 на
-очистку диска и 7:37 на сборку с пушем.
-
-### Теги образа
-
-| Триггер | Теги |
+| Директива | |
 |---|---|
-| push в `main` | `latest`, `comfy-<версия ComfyUI>`, `sha-<коммит>` |
-| тег `v1.2.3` | `1.2.3`, `comfy-<версия ComfyUI>`, `sha-<коммит>` |
+| `AuthenticationMethods publickey` | единственный допустимый метод |
+| `PasswordAuthentication no`, `KbdInteractiveAuthentication no`, `PermitEmptyPasswords no` | пароли выключены полностью |
+| `PermitRootLogin prohibit-password`, `AllowUsers root` | вход только root и только по ключу |
+| `PermitUserEnvironment no` | клиент не может подсунуть переменные окружения |
+| `AllowTcpForwarding local` | `ssh -L` работает, обратный проброс `-R` запрещён |
+| `GatewayPorts no`, `PermitTunnel no`, `AllowAgentForwarding no`, `X11Forwarding no` | остальные каналы закрыты |
+| `HostKey /etc/ssh/ssh_host_ed25519_key` | предлагается единственный тип хост-ключа |
+| `LoginGraceTime 20`, `MaxAuthTries 3`, `MaxSessions 4` | лимиты на подбор и на число сессий |
+| `ClientAliveInterval 30`, `ClientAliveCountMax 6` | мёртвые сессии закрываются |
+| `PrintMotd no`, `PrintLastLog no`, `Banner none` | при входе ничего не печатается |
 
-Версия ComfyUI в теге берётся из `ARG COMFYUI_REF` самого Dockerfile — он остаётся
-единственным источником правды. `workflow_dispatch` позволяет разово переопределить
-`COMFYUI_REF`, `CUDA_IMAGE` и `TORCH_INDEX_URL`, не трогая файл; пустое поле означает
-«взять из Dockerfile».
+В [`Dockerfile`](Dockerfile) объявлен ровно один порт — `EXPOSE 22`.
 
-Слой с torch занимает большую часть сборки, поэтому кэш пишется в `:buildcache` рядом
-с образом — правка `entrypoint.sh` пересобирает образ за минуту вместо восьми.
+## Сборка
 
-### Версии под вашу карту
+```bash
+docker build -t comfy-private .
+```
 
-Два ARG в [Dockerfile](Dockerfile) нужно свести между собой — это единственное место,
-где сборка может сломаться:
+Параметры сборки:
 
-- `CUDA_IMAGE` — тег с [hub.docker.com/r/nvidia/cuda](https://hub.docker.com/r/nvidia/cuda/tags)
-- `TORCH_INDEX_URL` — индекс колёс с [pytorch.org](https://pytorch.org/get-started/locally/),
-  версия CUDA должна совпадать с образом
-
-Для Blackwell (RTX 5090, B200) нужен `cu128` или новее; для более старых карт можно взять
-`cu126` и соответствующий образ CUDA.
-
-## Как подключить RunPod к GHCR
-
-Пакет приватный, поэтому RunPod нужны свои учётные данные.
-
-1. GitHub → Settings → Developer settings → **Personal access tokens (classic)**,
-   единственная галка `read:packages`.
-
-   Именно classic: в документации GitHub Packages прямо сказано, что
-   «GitHub Packages only supports authentication using a personal access token (classic)».
-   Fine-grained токен к `ghcr.io` не пустят, и по сообщению об ошибке это не диагностируется.
-
-2. RunPod → Settings → **Container Registry Auth** → New: имя произвольное,
-   username — ваш GitHub-логин, password — этот токен.
-
-3. В шаблоне выбрать созданную запись в «Select registry authentication».
-
-Первый пуш создаёт пакет приватным. Проверить — на странице пакета,
-Package settings → Change visibility.
-
-## Проверено на живом поде
-
-RunPod Secure Cloud, RTX PRO 6000 Blackwell Server Edition (97 ГБ VRAM), драйвер 595.91.07,
-`/dev/shm` 132 ГБ, overlay 150 ГБ:
-
-| | |
+| ARG | По умолчанию |
 |---|---|
-| Хост-ключ | предлагается только ed25519, генерируется под |
-| Вход по ключу / без ключа | проходит / `Permission denied (publickey)` |
-| `sshd -T` | совпадает с [sshd_hardening.conf](sshd_hardening.conf) |
-| torch | 2.11.0+cu128, `cuda.is_available()` → True, карта определилась |
-| ComfyUI | 0.36.0, стартует с заданными флагами, custom nodes пропущены |
-| Слушающие сокеты | `127.0.0.1:8188` и `0.0.0.0:22`, больше ничего |
-| ComfyUI через `ssh -L` | HTTP 200 |
-| Порт 8188 снаружи | `Connection refused` |
+| `CUDA_IMAGE` | `nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04` |
+| `COMFYUI_REF` | `v0.36.0` |
+| `TORCH_INDEX_URL` | `https://download.pytorch.org/whl/cu128` |
 
-Известное: база `ubuntu22.04` даёт Python 3.10, у которого EOL 31 октября 2026 — ComfyUI
-предупреждает об этом при старте. Переход на `ubuntu24.04` даст 3.12, но потребует учесть
-переименования пакетов `t64` (`libglib2.0-0` → `libglib2.0-0t64`).
+Базовый образ и индекс колёс torch должны быть согласованы по версии CUDA:
 
-## Настройки шаблона RunPod
+```bash
+docker build \
+  --build-arg CUDA_IMAGE=nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04 \
+  --build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cu126 \
+  -t comfy-private .
+```
 
-| Поле | Значение |
-|---|---|
-| Template type | Pods |
-| Compute type | NVIDIA GPU |
-| Container image | `ghcr.io/USER/REPO:comfy-v0.36.0` |
-| Start command | **пусто** — всё в `ENTRYPOINT` образа |
-| Container disk | 40–80 ГБ (образ ~12–15 ГБ распакованным + веса моделей) |
-| Persistent storage | Volume disk, **0 ГБ** |
-| Expose HTTP Ports | **пусто** — удалить всё, что там стоит по умолчанию |
-| Expose TCP Ports | `22` |
-| Environment variables | `PUBLIC_KEY` = содержимое вашего `id_ed25519.pub` |
+ComfyUI клонируется по тегу из `COMFYUI_REF`, каталог `.git` удаляется. Обновление версии —
+пересборка образа. Python берётся из базового образа (`python3` пакетом Ubuntu 24.04,
+то есть 3.12), зависимости ставятся в venv `/opt/venv`.
 
-Дефолтные 5 ГБ container disk не подойдут — образ не влезет.
+## Запуск
 
-Тег лучше фиксировать явно, а не `latest`: под тянет образ при каждом старте, и `latest`
-означает, что очередной коммит в `main` молча меняет то, что поднимется в следующий раз.
+```bash
+docker run -d --name comfy --gpus all \
+  -p 127.0.0.1:2222:22 \
+  --shm-size=8g \
+  -v "$PWD/models:/comfy/models" \
+  -e PUBLIC_KEY="$(cat ~/.ssh/id_ed25519.pub)" \
+  comfy-private
+```
 
-### Переменные окружения
-
-| Переменная | По умолчанию | Смысл |
-|---|---|---|
-| `PUBLIC_KEY` | — | обязательна, иначе контейнер осознанно падает на старте |
-| `COMFY_AUTOSTART` | `1` | `0` — поднять только sshd, ComfyUI запускать руками командой `comfyui` |
-| `COMFY_ALLOW_CUSTOM_NODES` | `0` | `1` — разрешить загрузку custom nodes |
-| `SSHD_LOG_TO_CONSOLE` | `0` | `1` — отправить лог sshd в консоль RunPod, для разбора проблем с входом |
-| `COMFY_PORT` | `8188` | |
-
-Значения переменных хранятся в БД RunPod. Публичный ключ там держать безопасно; приватные
-токены (например, `HF_TOKEN`) — нет, их лучше экспортировать в сессии по SSH.
+Рабочие каталоги и логи лежат в `/dev/shm`, поэтому его размер задаёт потолок для
+результатов и временных файлов. Entrypoint печатает при старте фактический размер
+`/dev/shm` и предупреждает, если тот оказался не tmpfs/ramfs.
 
 ## Подключение
 
-При запуске пода в логах RunPod печатается фингерпринт хост-ключа — он генерируется заново
-на каждый под, поэтому образ не содержит общего для всех ключа. Сверьте его при первом входе.
+Сверьте фингерпринт хост-ключа из лога контейнера:
 
 ```bash
-ssh root@POD_IP -p TCP_PORT -i ~/.ssh/id_ed25519 -L 8188:127.0.0.1:8188
+docker logs comfy
 ```
 
-IP и порт — в меню Connect → Direct TCP Ports. Дальше ComfyUI открывается локально
-на `http://127.0.0.1:8188`.
+Поднимите туннель:
 
-Логи внутри пода:
-
+```bash
+ssh -i ~/.ssh/id_ed25519 -p 2222 -L 8188:127.0.0.1:8188 root@HOST
 ```
+
+ComfyUI открывается локально на `http://127.0.0.1:8188`.
+
+Логи внутри контейнера:
+
+```bash
 tail -f /dev/shm/comfy/comfyui.log
 tail -f /dev/shm/comfy/sshd.log
 ```
+
+Если ComfyUI не запускался автоматически, в SSH-сессии доступна команда `comfyui` —
+это тот же скрипт, и любые дополнительные аргументы он передаёт в `main.py`.
+
+## Переменные окружения
+
+| Переменная | По умолчанию | Смысл |
+|---|---|---|
+| `PUBLIC_KEY` | — | обязательна; при пустом значении entrypoint завершается с ошибкой |
+| `COMFY_AUTOSTART` | `1` | любое другое значение — поднять только sshd, ComfyUI запускать вручную |
+| `COMFY_ALLOW_CUSTOM_NODES` | `1` | любое другое значение добавляет `--disable-all-custom-nodes` |
+| `SSHD_LOG_TO_CONSOLE` | `0` | `1` — sshd логирует в консоль контейнера вместо файла в RAM |
+| `COMFY_PORT` | `8188` | порт ComfyUI на `127.0.0.1` |
+
+Пути тоже задаются переменными окружения образа: `COMFY_HOME=/opt/comfyui`,
+`COMFY_DATA_ROOT=/comfy`, `COMFY_RAM_ROOT=/dev/shm/comfy`.
 
 ## Куда что пишется
 
 | Путь | Носитель | Содержимое |
 |---|---|---|
 | `/dev/shm/comfy/output` | RAM | результаты |
-| `/dev/shm/comfy/input` | RAM | входные изображения |
-| `/dev/shm/comfy/temp` | RAM | превью, промежуточные тензоры |
-| `/dev/shm/comfy/user` | RAM | настройки фронтенда, сохранённые воркфлоу |
-| `/dev/shm/comfy/*.log` | RAM | логи ComfyUI и sshd |
-| `/comfy/models` | container disk | веса |
-| `sqlite:///:memory:` | RAM | БД ComfyUI (ассеты, миграции alembic) |
+| `/dev/shm/comfy/input` | RAM | входные файлы |
+| `/dev/shm/comfy/temp` | RAM | превью и промежуточные файлы |
+| `/dev/shm/comfy/user` | RAM | пользовательский каталог ComfyUI: настройки, сохранённые воркфлоу |
+| `/dev/shm/comfy/cache` | RAM | `XDG_CACHE_HOME`, `MPLCONFIGDIR` |
+| `/dev/shm/comfy/comfyui.log`, `/dev/shm/comfy/sshd.log` | RAM | логи |
+| `sqlite:///:memory:` | RAM | база данных ComfyUI |
+| `/comfy/models` | диск | веса |
+| `/comfy/huggingface`, `/comfy/torch` | диск | `HF_HOME` и `TORCH_HOME`, если не переопределены |
 
-Размер `/dev/shm` печатается в лог при старте. RunPod выдаёт его по объёму RAM хоста —
-на проверенном поде это 132 ГБ, так что вывод в RAM ничем не стеснён. Но если попадётся
-хост с докеровским дефолтом в 64 МБ, места хватит на десяток картинок: смотрите лог.
+Каталог в RAM создаётся с режимом 700, как и все подкаталоги внутри него.
 
-Своя `tmpfs` через `mount` внутри пода не поднимется — RunPod не даёт `CAP_SYS_ADMIN`.
-Поэтому используется `/dev/shm`, который всегда tmpfs.
+## Custom nodes
 
-## Рабочий цикл с данными
+Включены по умолчанию: `--disable-all-custom-nodes` добавляется только тогда, когда
+`COMFY_ALLOW_CUSTOM_NODES` не равна `1`. Перечисленные выше флаги — это аргументы
+самого ComfyUI и на код сторонних нод не распространяются.
 
-Веса моделей публичны — их можно качать прямо в под с HF. Приватные LoRA, входные изображения
-и результаты гоняются через тот же SSH:
+## CI
 
-```bash
-rsync -e "ssh -p TCP_PORT -i ~/.ssh/id_ed25519" -av ./my_lora.safetensors root@POD_IP:/comfy/models/loras/
-```
+[`.github/workflows/build.yml`](.github/workflows/build.yml), две джобы.
 
-```bash
-rsync -e "ssh -p TCP_PORT -i ~/.ssh/id_ed25519" -av root@POD_IP:/dev/shm/comfy/output/ ./out/
-```
+`smoke-test` выполняется на push в `main`, на теги `v*` и на pull request
+(правки только в `*.md` сборку не запускают):
 
-Если приватные LoRA не должны касаться диска — кладите их в `/dev/shm/comfy/` и подключайте
-через `extra_model_paths.yaml`, ценой оперативной памяти.
+- `actionlint` по самому workflow;
+- `shellcheck` по [`entrypoint.sh`](entrypoint.sh), [`comfyui.sh`](comfyui.sh)
+  и [`ci/smoke-test.sh`](ci/smoke-test.sh);
+- `docker build --check` по Dockerfile;
+- сборка облегчённого двойника [`ci/Dockerfile.sshtest`](ci/Dockerfile.sshtest):
+  `ubuntu:24.04` с теми же `entrypoint.sh`, `comfyui.sh` и `sshd_hardening.conf`, но без CUDA
+  и torch;
+- запуск [`ci/smoke-test.sh`](ci/smoke-test.sh) на этом двойнике.
 
-## Локальная сборка
+Смоук-тест поднимает контейнер с одноразовым ключом и проверяет семь вещей:
 
-```bash
-docker build -t comfy-private:dev .
-```
+1. entrypoint печатает в лог фингерпринт хост-ключа;
+2. в образе нет вшитых хост-ключей;
+3. вход по ключу проходит;
+4. вход без ключа (пароль, keyboard-interactive) отбивается;
+5. `sshd -T` отдаёт `passwordauthentication no`, `authenticationmethods publickey`,
+   `permitrootlogin without-password`, `permitemptypasswords no`, `x11forwarding no`,
+   `allowtcpforwarding local`;
+6. через `ssh -L` проходит соединение и приходит SSH-баннер;
+7. без `PUBLIC_KEY` контейнер не стартует.
+
+`publish` идёт после зелёного смоук-теста и только не на pull request: собирает
+`linux/amd64` и пушит в `ghcr.io/<owner>/<repo>`. Значения build args берутся из
+`ARG`-дефолтов Dockerfile, а `workflow_dispatch` позволяет разово переопределить
+`COMFYUI_REF`, `CUDA_IMAGE` и `TORCH_INDEX_URL`, не трогая файл. Кэш слоёв пишется
+в `:buildcache` рядом с образом.
+
+| Триггер | Теги |
+|---|---|
+| push в `main` | `latest`, `comfy-<COMFYUI_REF>`, `sha-<коммит>` |
+| тег `v1.2.3` | `1.2.3`, `comfy-<COMFYUI_REF>`, `sha-<коммит>` |
+
+## Локальная проверка
 
 ```bash
 docker build -f ci/Dockerfile.sshtest -t comfy-sshtest . && ci/smoke-test.sh comfy-sshtest
 ```
 
-## Что осталось за кадром
+Порты теста настраиваются переменными `SMOKE_SSH_PORT` (по умолчанию 2222)
+и `SMOKE_FWD_PORT` (9999).
 
-- Custom nodes выключены по умолчанию. Любая включённая нода может игнорировать
-  `--disable-metadata` и ходить в сеть самостоятельно — включать по одной и осознанно.
-- ComfyUI-Manager намеренно не установлен: он регулярно опрашивает внешние реестры.
-- Версия ComfyUI закреплена (`COMFYUI_REF`). Обновление — пересборка образа, не `git pull`
-  внутри пода: иначе содержимое пода перестаёт соответствовать образу.
-- Egress-фильтрации нет. Если нужно запретить поду исходящие соединения после загрузки
-  моделей — это `iptables` внутри контейнера, но `CAP_NET_ADMIN` RunPod тоже не даёт.
+## Чего образ не делает
+
+Всё перечисленное — про сеть и про файловую систему внутри контейнера. Тот, у кого
+root на хост-машине, видит процессы контейнера, его память, VRAM и содержимое `/dev/shm`;
+настройками внутри образа это не меняется. Точно так же освобождение диска после удаления
+контейнера не является гарантированным стиранием данных.
+
+Исходящий трафик не фильтруется: контейнер может обращаться в сеть, и ограничить это
+средствами самого образа нельзя.
